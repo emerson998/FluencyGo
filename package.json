@@ -11,8 +11,8 @@
     "build": "node build.mjs",
     "start": "node --env-file-if-exists=.env server.js",
     "dev": "npm run build && node --env-file-if-exists=.env --watch server.js",
-    "test": "node --test",
-    "check": "node --check server.js && node --check provider.js && node --check speech.js && node --check src/audio.js && npm run build"
+    "test": "node --test \"test/*.test.js\"",
+    "check": "node --check server.js && node --check provider.js && node --check speech.js && node --check json.js && node --check tts.js && node --check scene.js && node --check live.js && node --check src/audio.js && npm run build"
   },
   "dependencies": {
     "react": "^19.3.1",

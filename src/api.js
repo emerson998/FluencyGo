@@ -1,0 +1,5 @@
+const offline='Servidor indisponível. Confira se o npm start está rodando e recarregue a página.';
+async function post(path,data,signal){try{return await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal});}catch(e){if(e?.name==='AbortError')throw e;throw new Error(offline);}}
+export async function api(path,data,{signal}={}){const response=await post(path,data,signal);let result;try{result=await response.json();}catch{throw new Error(offline);}if(!response.ok)throw Object.assign(new Error(result.error||'Não foi possível completar a solicitação.'),{status:response.status});return result;}
+// Corpo binário (áudio do Piper); erros continuam vindo em JSON.
+export async function apiAudio(path,data,{signal}={}){const response=await post(path,data,signal);if(!response.ok){let message='Voz indisponível.';try{message=(await response.json()).error||message;}catch{}throw Object.assign(new Error(message),{status:response.status});}return response.blob();}

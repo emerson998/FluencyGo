@@ -1,21 +1,50 @@
 import { spawn } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
+import { parseJsonLoose } from './json.js';
 export const providers = ['codex', 'claude'];
 export function command(provider) {
   if (provider === 'codex') return ['codex', ['exec', '--skip-git-repo-check', '--sandbox', 'read-only', '--ephemeral', '-']];
   if (provider === 'claude') return ['claude', ['-p', '--output-format', 'text', '--tools', '', '--disallowedTools', 'mcp__*', '--no-session-persistence']];
   throw new Error('Provedor inválido.');
 }
+// Windows: npm instala lançadores .cmd, que spawn sem shell não executa. Lê o alvo do lançador
+// (um .exe ou um .js rodado pelo node) e executa direto, mantendo shell:false.
+export function resolveBinary(binary, args, { platform = process.platform, path = process.env.PATH || '' } = {}) {
+  if (platform !== 'win32' || /[\\/.]/.test(binary)) return [binary, args];
+  for (const dir of path.split(delimiter).filter(Boolean)) {
+    if (existsSync(join(dir, `${binary}.exe`))) return [join(dir, `${binary}.exe`), args];
+    const shim = join(dir, `${binary}.cmd`);
+    if (!existsSync(shim)) continue;
+    const target = [...readFileSync(shim, 'utf8').matchAll(/"%(?:dp0%|~dp0)\\?([^"%]+\.(?:exe|js|cjs|mjs))"/gi)].at(-1)?.[1];
+    if (!target) continue;
+    const full = join(dirname(shim), target);
+    if (/\.exe$/i.test(full)) return [full, args];
+    const node = join(dirname(shim), 'node.exe');
+    return [existsSync(node) ? node : process.execPath, [full, ...args]];
+  }
+  return [binary, args];
+}
+// O codex.js do npm roda o binário nativo como neto: matar só o filho deixaria o CLI órfão.
+export function killTree(child) {
+  if (!child.pid) return;
+  if (process.platform === 'win32') spawn('taskkill', ['/T', '/F', '/PID', String(child.pid)], { windowsHide: true }).on('error', () => child.kill('SIGKILL'));
+  else try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+}
+// No Windows a pasta pode seguir travada por instantes após o processo morrer; falhar aqui não deve esconder o erro real.
+export const removeDir = dir => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
 export function runProcess(binary, args, input = '', { cwd, timeout = 120000 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, { cwd, shell: false, windowsHide: true });
+    const [file, argv] = resolveBinary(binary, args);
+    const child = spawn(file, argv, { cwd, shell: false, windowsHide: true, detached: process.platform !== 'win32' });
     let output = '', settled = false;
     const finish = (err) => { if (settled) return; settled = true; clearTimeout(timer); err ? reject(err) : resolve(output.trim()); };
-    const timer = setTimeout(() => { child.kill('SIGKILL'); finish(new Error('Tempo limite excedido. Tente novamente.')); }, timeout);
+    const timer = setTimeout(() => { killTree(child); finish(new Error('Tempo limite excedido. Tente novamente.')); }, timeout);
     child.on('error', () => finish(new Error(`${binary} indisponível. Instale e autentique o CLI no terminal antes de começar.`)));
-    child.stdout.on('data', b => { output += b; if (Buffer.byteLength(output) > 256000) { child.kill('SIGKILL'); finish(new Error('Resposta excedeu o limite.')); } });
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', b => { output += b; if (Buffer.byteLength(output) > 256000) { killTree(child); finish(new Error('Resposta excedeu o limite.')); } });
     // Não devolve stderr: pode conter detalhes privados da conta e do ambiente.
     child.stderr.resume();
     child.stdin.on('error', () => {});
@@ -34,12 +63,13 @@ export function promptFor(data) {
 }
 export function parseReply(raw) {
   let data;
-  try { data = JSON.parse(raw.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'')); } catch { throw new Error('O CLI respondeu em formato inesperado. Tente novamente.'); }
-  if (!data || ['reply','translation','feedback'].some(k => typeof data[k] !== 'string' || data[k].length > 8000) || !data.reply.trim() || !Array.isArray(data.vocabulary) || data.vocabulary.length > 3 || data.vocabulary.some(v => !v || typeof v.word !== 'string' || typeof v.meaning !== 'string' || v.word.length > 200 || v.meaning.length > 500)) throw new Error('Resposta do professor inválida. Tente novamente.');
+  try { data = parseJsonLoose(raw); } catch { throw new Error('O CLI respondeu em formato inesperado. Tente novamente.'); }
+  // reply volta no histórico, que validate limita a 4.000 caracteres por mensagem.
+  if (!data || ['reply','translation','feedback'].some(k => typeof data[k] !== 'string' || data[k].length > (k === 'reply' ? 4000 : 8000)) || !data.reply.trim() || !Array.isArray(data.vocabulary) || data.vocabulary.length > 3 || data.vocabulary.some(v => !v || typeof v.word !== 'string' || typeof v.meaning !== 'string' || v.word.length > 200 || v.meaning.length > 500)) throw new Error('Resposta do professor inválida. Tente novamente.');
   return data;
 }
 export async function teach(data, runner = runProcess) {
   const prompt = promptFor(data), [binary,args] = command(data.provider);
   const cwd = await mkdtemp(join(tmpdir(),'lingua-cli-'));
-  try { return parseReply(await runner(binary,args,prompt,{cwd})); } finally { await rm(cwd,{recursive:true,force:true}); }
+  try { return parseReply(await runner(binary,args,prompt,{cwd})); } finally { await removeDir(cwd); }
 }

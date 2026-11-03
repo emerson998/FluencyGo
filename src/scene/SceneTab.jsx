@@ -1,0 +1,71 @@
+import React, {useState, useEffect, useRef} from 'react';
+import {api, apiAudio} from '../api.js';
+import {speak, useMicrophone} from '../voice.jsx';
+import {createEngine, PAUSE_DEFAULT, MIN_SECONDS, MIN_TURNS} from './engine.js';
+import {createTurnDetector} from './turnDetector.js';
+import {createBargeIn} from './bargeIn.js';
+import {createPlayer, LANGS} from './player.js';
+import {earcon} from './earcons.js';
+import {loadScenes, saveCurrent, addSession} from './store.js';
+import {normalize, similarity, ACCEPT} from './matcher.js';
+const PLACES={cafe:'☕ Café',airport:'✈ Aeroporto',hotel:'▣ Hotel',restaurant:'◈ Restaurante',shop:'◇ Loja',street:'↗ Na rua'};
+const PAUSES=[['Curta · 1,0 s',1000],['Média · 1,5 s',1500],['Longa · 2,2 s',2200]];
+const STAGES={1:'Com texto',2:'Só dicas',3:'Só voz'};
+const PHASES={IDLE:'Preparando',TUTOR_SPEAKING:'Professor falando',LISTENING:'Sua vez',THINKING:'Pensando',PAUSED:'Pausado',DONE:'Fim'};
+const seconds=ms=>ms===null||ms===undefined?'—':`${(ms/1000).toFixed(1).replace('.',',')} s`;
+// Tudo o que a cena pode falar: gerado antes, para responder sem esperar o Piper.
+function sceneItems(map){const t=map.language,items=[],add=(voice,text)=>{if(text)items.push({voice,text});};for(const n of map.nodes){add(t,n.tutor);for(const e of n.likelyErrors||[]){add(t,e.recast);if(e.trained)add('pt',e.explain_ptbr);}}for(const r of map.recovery)add(t,r);for(const f of map.fillers)add(t,f);for(const n of map.nodes)add('pt',n.hint_ptbr);for(const h of map.helpPhrases)add(t,h.text);for(const n of map.nodes)add(t,n.expected[0].text);return items;}
+export function SceneTab({config,tts,onLock}){
+ const piper=Boolean(tts[config.language]&&tts.pt);
+ const [saved]=useState(()=>{const c=loadScenes().current;return c?.map?.language===config.language&&c.map.level===config.level?c:null;});
+ const [view,setView]=useState('setup'),[place,setPlace]=useState('cafe'),[headset,setHeadset]=useState(false),[pauseMs,setPauseMs]=useState(PAUSE_DEFAULT[config.level]),[map,setMap]=useState(null),[stage,setStage]=useState(1),[phase,setPhase]=useState('IDLE'),[nodeId,setNodeId]=useState(null),[summary,setSummary]=useState(null),[error,setError]=useState(''),[practice,setPractice]=useState(null);
+ const player=useRef(null),talk=useRef(null);
+ if(!player.current)player.current=createPlayer({fetchAudio:item=>apiAudio('/api/tts',{voice:item.voice,text:item.text}),speak,tts});
+ const mic=useMicrophone(text=>setPractice(p=>p&&{...p,heard:text,ok:similarity(normalize(text,config.language),normalize(p.text,config.language))>=ACCEPT}),()=>{},setError);
+ useEffect(()=>{onLock(view==='loading'||view==='talk'||mic.recording);},[view,mic.recording]);
+ useEffect(()=>()=>{onLock(false);stopTalk();player.current.dispose();},[]);
+ useEffect(()=>{if(view!=='talk')return;const onKey=e=>{if(/INPUT|TEXTAREA|SELECT/.test(e.target.tagName))return;if(e.key===' '){e.preventDefault();control(talk.current?.engine.state.phase==='PAUSED'?'resume':'pause');}else if(e.key==='r'||e.key==='R')control('repeat');else if(e.key==='Escape')control('exit');};window.addEventListener('keydown',onKey);return()=>window.removeEventListener('keydown',onKey);},[view]);
+ async function prepare(){setError('');setView('loading');try{const m=await api('/api/scene',{language:config.language,level:config.level,place});setMap(m);setStage(1);saveCurrent({map:m,stage:1,nodeId:m.nodes[0].id,history:[],pauseMs,headset});setView('teach');player.current.preload(sceneItems(m));}catch(e){setError(e.message);setView('setup');}}
+ function listen(item){player.current.play([item]).catch(e=>setError(e.message));}
+ function stopTalk(){const t=talk.current;if(!t)return;t.closed=true;talk.current=null;for(const id of t.timers)clearTimeout(id);t.detector.stop();t.barge?.close();player.current.stop();t.live.then(sceneId=>api('/api/scene/end',{sceneId}).catch(()=>{}),()=>{});}
+ function control(type){const t=talk.current;if(!t)return;t.run({type:'click'});t.run({type});}
+ function startTalk(m,st,startNode,history=[]){
+  const Recognition=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!Recognition){setError('Reconhecimento de fala indisponível. Use Chrome ou Edge.');return;}
+  stopTalk();player.current.preload(sceneItems(m));setMap(m);setStage(st);setSummary(null);setError('');setPhase('IDLE');setView('talk');
+  const useHeadset=headset&&piper;
+  const engine=createEngine({map:m,headset:useHeadset,stage:st,nodeId:startNode,history,now:()=>performance.now()});
+  const t={engine,timers:new Set(),barge:null,closed:false};talk.current=t;
+  // O Claude da cena abre enquanto o professor diz a primeira fala: a inicialização (6–8 s) fica escondida.
+  const openLive=past=>api('/api/scene/live',{map:m,history:past.slice(-6)}).then(r=>r.sceneId);
+  t.live=openLive(history);t.live.catch(()=>{});
+  // 409: o servidor perdeu a cena (reinício, outra aba). Reabre com as últimas falas e repete o turno uma vez.
+  const callTurn=(a,retry=true)=>t.live.then(sceneId=>api('/api/scene/turn',{sceneId,transcript:a.transcript.slice(0,500),nodeId:a.nodeId})).catch(e=>{if(!retry||e.status!==409||t.closed)throw e;t.live=openLive(engine.state.history);t.live.catch(()=>{});return callTurn(a,false);});
+  const run=event=>{if(t.closed)return;const actions=engine.dispatch(event),state=engine.state;setPhase(state.phase);setNodeId(state.nodeId);for(const a of actions)perform(a);};
+  t.run=run;
+  t.detector=createTurnDetector({Recognition,lang:LANGS[m.language],pauseMs,onFinal:text=>run({type:'speechFinal',text}),onError:kind=>{setError(kind==='mic'?'Microfone bloqueado. Permita o microfone no navegador e continue.':'O reconhecimento de fala parou várias vezes. Continue quando quiser.');run({type:'pause'});}});
+  function perform(a){
+   switch(a.type){
+    case 'play':t.barge?.arm();player.current.play(a.items,{onStart:()=>run({type:'audioStarted',turnId:a.turnId,filler:a.filler})}).then(done=>{t.barge?.disarm();if(done&&!a.filler)run({type:'ttsEnded',turnId:a.turnId});},e=>{t.barge?.disarm();setError(e.message);if(!a.filler)run({type:'ttsEnded',turnId:a.turnId});});break;
+    case 'stop':t.barge?.disarm();player.current.stop();break;
+    case 'listen':t.detector.start();t.detector.reset();break;
+    case 'unlisten':t.detector.stop();break;
+    case 'earcon':earcon(a.kind);break;
+    case 'timer':{const id=setTimeout(()=>{t.timers.delete(id);run({type:a.event,id:a.id});},a.ms);t.timers.add(id);break;}
+    case 'callLive':callTurn(a).then(reply=>run({type:'turnReply',reply,turnId:a.turnId}),()=>run({type:'turnTimeout',turnId:a.turnId}));break;
+    case 'save':saveCurrent({map:m,stage:st,nodeId:a.snapshot.nodeId,history:a.snapshot.history,pauseMs,headset:useHeadset});break;
+    case 'done':addSession({date:new Date().toISOString(),language:m.language,level:m.level,place:m.place,stage:st,summary:a.summary});stopTalk();setSummary(a.summary);setView('summary');break;
+   }
+  }
+  const begin=()=>run({type:'start'});
+  if(!useHeadset)return begin();
+  // Com fone a escuta fica aberta o tempo todo: falar por cima do professor o interrompe.
+  createBargeIn({onBargeIn:()=>run({type:'bargeIn'})}).then(async b=>{if(t.closed)return b.close();t.barge=b;await b.calibrate();if(!t.closed){t.detector.start();begin();}},()=>{setError('Não foi possível abrir o microfone para interromper o professor. Seguindo sem interrupção.');begin();});
+ }
+ const node=map?.nodes.find(n=>n.id===nodeId);
+ if(view==='loading')return <section className="panel scene-panel" aria-live="polite"><span className="eyebrow">MODO CENA · CLAUDE CLI</span><h2>Preparando sua cena…</h2><div className="scene-progress" role="progressbar" aria-label="Gerando a cena"><span/></div><p className="muted">O professor está escrevendo o diálogo, as respostas esperadas e as correções. Isso leva de 30 segundos a 1 minuto.</p></section>;
+ if(view==='teach')return <section className="scene-teach"><div className="panel scene-panel"><span className="eyebrow">FASE 1 · APRENDA A CENA</span><h2>{map.title}</h2><p className="muted">Ouça cada fala, veja a tradução e repita a resposta em voz alta. Depois, viva a cena em três passos.</p><ol className="scene-lines">{map.nodes.map(n=><li key={n.id}><p className="scene-tutor">{n.tutor}</p><small>{n.tutor_ptbr}</small><button className="quiet" onClick={()=>listen({voice:map.language,text:n.tutor})}>◖ Ouvir</button><p className="scene-answer">Você: <strong>{n.expected[0].text}</strong></p><button className="quiet" onClick={()=>listen({voice:map.language,text:n.expected[0].text})}>◖ Ouvir resposta</button><button className="quiet" disabled={mic.recording} onClick={()=>{setPractice({id:n.id,text:n.expected[0].text});mic.start(LANGS[map.language]);}}>{mic.recording&&practice?.id===n.id?'● Ouvindo…':'♬ Repetir'}</button>{practice?.id===n.id&&practice.heard&&<p className={practice.ok?'scene-ok':'scene-retry'}>{practice.ok?'✓ ':'↺ '}{practice.heard}</p>}</li>)}</ol></div><aside className="panel scene-panel"><span className="eyebrow">PARA PEDIR AJUDA NA CENA</span><ul className="scene-help">{map.helpPhrases.map(h=><li key={h.text}><button className="quiet" onClick={()=>listen({voice:map.language,text:h.text})}>◖ {h.text}</button><small>{h.translation_ptbr}</small></li>)}</ul><span className="eyebrow">FASE 2 · VIVA A CENA</span>{[1,2,3].map(s=><button key={s} className={s===3?'primary scene-go':'quiet scene-step'} onClick={()=>startTalk(map,s,map.nodes[0].id)}>Passo {s} · {STAGES[s]} ↗</button>)}<p className="fine">No passo 3 não há texto na tela. Para pedir ajuda, fale uma das frases acima. Espaço pausa, R repete, Esc sai.</p><button className="quiet" onClick={()=>setView('setup')}>Escolher outra cena</button><p className="error" role="alert">{error}</p></aside></section>;
+ if(view==='talk')return <section className="panel scene-talk"><span className="eyebrow">PASSO {stage} · {STAGES[stage].toUpperCase()}</span><div className={`scene-state ${phase.toLowerCase()}`} role="status" aria-live="polite"><span className="scene-orb" aria-hidden="true"><i/><i/><i/></span><strong>{PHASES[phase]}</strong></div>{stage===1&&node&&<div className="scene-cue"><p className="scene-tutor">{node.tutor}</p><p className="scene-answer">Você: <strong>{node.expected[0].text}</strong></p></div>}{stage===2&&node&&<div className="scene-cue"><p className="scene-hint">Dica: {node.hint_ptbr}</p></div>}<div className="scene-controls"><button onClick={()=>control(phase==='PAUSED'?'resume':'pause')}>{phase==='PAUSED'?'▶ Continuar':'❚❚ Pausar'}</button><button onClick={()=>control('repeat')}>↺ Repetir</button><button onClick={()=>control('exit')}>✕ Sair</button></div><p className="error" role="alert">{error}</p></section>;
+ if(view==='summary'&&summary)return <section className="panel scene-panel scene-summary"><span className="eyebrow">RESUMO DA CENA · PASSO {stage}</span><h2>{summary.passed?'Você sustentou a cena só com voz.':stage===3?'Boa prática. Ainda não foram 5 minutos sem apoio.':'Cena concluída.'}</h2><div className="scores"><div><strong>{Math.floor(summary.durationMs/60000)}:{String(Math.floor(summary.durationMs/1000)%60).padStart(2,'0')}</strong><small>Duração</small></div><div><strong>{summary.turns}</strong><small>Suas falas</small></div><div><strong>{summary.corrections}</strong><small>Correções</small></div><div><strong>{summary.offScript}</strong><small>Fora do roteiro</small></div></div><p className="muted">Espera do professor: {seconds(summary.mapMedianMs)} no roteiro (mediana) · {seconds(summary.liveMedianMs)} fora do roteiro (mediana), {seconds(summary.liveP95Ms)} no pior caso (p95). Cliques: {summary.clicks}. Interrupções: {summary.bargeIns}.</p><p className="fine">Meta do passo 3: pelo menos {MIN_SECONDS/60} minutos, {MIN_TURNS} falas suas e nenhum clique.</p><div className="voice-actions">{stage<3&&<button className="primary" onClick={()=>startTalk(map,stage+1,map.nodes[0].id)}>Ir para o passo {stage+1} ↗</button>}<button className="quiet" onClick={()=>startTalk(map,stage,map.nodes[0].id)}>Repetir este passo</button><button className="quiet" onClick={()=>setView('teach')}>Rever a cena</button><button className="quiet" onClick={()=>setView('setup')}>Nova cena</button></div></section>;
+ return <section className="panel scene-panel scene-setup"><span className="eyebrow">MODO CENA · CLAUDE CLI</span><h2>Aprenda um diálogo. Depois, viva a cena por voz.</h2><p className="muted">O professor prepara a cena, ensina cada fala e depois conversa com você, corrigindo como um professor faria.</p><fieldset><legend>Onde acontece a cena?</legend><div className="choices scene-places">{Object.entries(PLACES).map(([id,label])=><label className="choice" key={id}><input type="radio" name="place" checked={place===id} onChange={()=>setPlace(id)}/><strong>{label}</strong></label>)}</div></fieldset><label className="field">Quanto silêncio encerra a sua fala?<select value={PAUSES.some(p=>p[1]===pauseMs)?pauseMs:'custom'} onChange={e=>e.target.value!=='custom'&&setPauseMs(Number(e.target.value))}>{PAUSES.map(([label,ms])=><option key={ms} value={ms}>{label}</option>)}{!PAUSES.some(p=>p[1]===pauseMs)&&<option value="custom">Personalizada · {seconds(pauseMs)}</option>}</select></label><details><summary className="fine">Ajuste fino da pausa</summary><label className="field">Segundos (0,6 a 3)<input type="number" min="0.6" max="3" step="0.1" value={pauseMs/1000} onChange={e=>{const v=Number(e.target.value);if(v>=.6&&v<=3)setPauseMs(Math.round(v*1000));}}/></label></details><label className="mode"><input type="checkbox" checked={headset&&piper} disabled={!piper} onChange={e=>setHeadset(e.target.checked)}/> Estou de fone de ouvido (permite interromper o professor)</label>{!piper&&<p className="notice">Voz Piper não configurada: a cena usa a voz do navegador e não dá para interromper o professor. Veja “Modo Cena” no README.</p>}<button className="primary" onClick={prepare}>Preparar a cena ↗</button>{saved&&<button className="quiet" onClick={()=>startTalk(saved.map,saved.stage||1,saved.nodeId,saved.history||[])}>Continuar a cena “{saved.map.title}” de onde parei</button>}<p className="fine">A escuta contínua do Chrome/Edge envia o áudio ao serviço de reconhecimento do navegador durante a cena.</p><p className="error" role="alert">{error}</p></section>;
+}
